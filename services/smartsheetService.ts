@@ -2,90 +2,107 @@
 import { Workspace, Share, WorkspaceDetails } from '../types';
 
 /**
- * We use a CORS proxy to bypass the browser's Same-Origin Policy since the Smartsheet API
- * does not currently support CORS requests directly from the browser.
- * corsproxy.io is generally reliable for passing through Authorization headers.
+ * CORS Proxy Strategy:
+ * Browser-based Smartsheet API calls require a proxy.
+ * We use a primary and secondary proxy to handle network-level blockages.
  */
-const PROXY_URL_PREFIX = 'https://corsproxy.io/?';
+const PRIMARY_PROXY = 'https://api.allorigins.win/raw?url=';
+const SECONDARY_PROXY = 'https://corsproxy.io/?';
 const API_BASE_URL = 'https://api.smartsheet.com/2.0';
 
+interface PaginatedResponse<T> {
+    pageNumber: number;
+    pageSize: number;
+    totalPages: number;
+    totalCount: number;
+    data: T[];
+}
+
 /**
- * Helper function to handle Smartsheet API requests via a CORS proxy.
+ * Robust fetcher that attempts to bypass CORS and network restrictions.
  */
-async function smartsheetFetch<T>(url: string, apiKey: string): Promise<T> {
-    if (!apiKey) {
-        throw new Error('Smartsheet API Key is missing.');
-    }
+async function smartsheetFetch<T>(url: string, apiKey: string, useFallback = false): Promise<T> {
+    if (!apiKey) throw new Error('Smartsheet API Key is missing.');
 
-    // Standard Smartsheet headers
-    const headers = {
-        'Authorization': `Bearer ${apiKey}`,
-        'Accept': 'application/json',
-        'Content-Type': 'application/json'
-    };
-
-    const proxiedUrl = `${PROXY_URL_PREFIX}${encodeURIComponent(url)}`;
-
+    const proxy = useFallback ? SECONDARY_PROXY : PRIMARY_PROXY;
+    const proxiedUrl = `${proxy}${encodeURIComponent(url)}`;
+    
     try {
-        console.debug(`Fetching: ${url} via proxy...`);
-        const response = await fetch(proxiedUrl, { 
-            headers,
+        const response = await fetch(proxiedUrl, {
             method: 'GET',
-            mode: 'cors'
+            headers: {
+                'Authorization': `Bearer ${apiKey}`,
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+            }
         });
 
         if (!response.ok) {
-            // Detailed status code handling
-            if (response.status === 401) {
-                throw new Error('Unauthorized: Please verify your Smartsheet API token.');
-            }
+            // Detailed handling for Forbidden (403)
             if (response.status === 403) {
-                throw new Error('Forbidden: Your token lacks permission to view these workspaces.');
-            }
-            if (response.status === 404) {
-                throw new Error('Resource not found: The Smartsheet API endpoint is invalid.');
-            }
-            if (response.status === 429) {
-                throw new Error('Rate limit exceeded: Too many requests. Please wait a minute and try again.');
+                throw new Error(
+                    'Forbidden (403): Smartsheet rejected the request. ' +
+                    'This often means your API key lacks "Admin" permissions, or your Smartsheet account has ' +
+                    'IP restrictions that block the proxy. Ensure your key has full access to the target resources.'
+                );
             }
             
-            let errorBody = '';
-            try {
-                errorBody = await response.text();
-            } catch (e) {
-                errorBody = response.statusText;
-            }
-            throw new Error(`Smartsheet API Error (${response.status}): ${errorBody}`);
-        }
-        
-        const data = await response.json();
-        
-        // Some proxies might return a successful status code but include an error message in the JSON
-        if (data && data.errorCode !== undefined) {
-            throw new Error(`Smartsheet API Error (${data.errorCode}): ${data.message}`);
+            if (response.status === 401) throw new Error('Unauthorized (401): Invalid Smartsheet API token.');
+            if (response.status === 429) throw new Error('Rate Limit (429): Too many requests. Waiting 60s is recommended.');
+            
+            const errorText = await response.text().catch(() => 'No error body');
+            throw new Error(`Smartsheet API Error (${response.status}): ${errorText || response.statusText}`);
         }
 
-        return data;
+        return await response.json();
     } catch (err) {
-        console.error('Smartsheet fetch error details:', err);
+        // If the primary proxy fails at the network level, try the secondary once
+        if (!useFallback && err instanceof Error && (err.message.includes('fetch') || err.message.includes('Load failed'))) {
+            console.warn('Primary proxy failed, attempting fallback...');
+            return smartsheetFetch(url, apiKey, true);
+        }
+
+        console.error('Final fetch failure:', err);
         if (err instanceof Error) {
-            // Check for common fetch failure scenarios
             if (err.message.includes('Failed to fetch') || err.message.includes('Load failed')) {
-                throw new Error('Connection failed. This is usually caused by the CORS proxy being temporarily unavailable or blocked by your network/ad-blocker. Please check your internet or try again in a moment.');
+                throw new Error(
+                    'Network Error: The CORS proxy is unreachable. This is almost certainly caused by ' +
+                    'a browser extension (like uBlock Origin, AdBlock) or a corporate firewall blocking ' +
+                    'known proxy domains. Please disable extensions and try again.'
+                );
             }
             throw err;
         }
-        throw new Error('An unexpected network error occurred. Please check your browser console for more details.');
+        throw new Error('An unexpected connection error occurred.');
     }
 }
 
 /**
- * Lists all workspaces accessible by the user.
+ * Lists ALL workspaces using pagination logic.
+ * Smartsheet limits results to 100 by default; we request 1000 and loop through all pages.
  */
-async function listWorkspaces(apiKey: string): Promise<Workspace[]> {
-    const url = `${API_BASE_URL}/workspaces`;
-    const response = await smartsheetFetch<{ data: Workspace[] }>(url, apiKey);
-    return response.data || [];
+async function listAllWorkspaces(apiKey: string): Promise<Workspace[]> {
+    let allWorkspaces: Workspace[] = [];
+    let currentPage = 1;
+    let totalPages = 1;
+
+    do {
+        // pageSize=1000 is the maximum allowed per page
+        const url = `${API_BASE_URL}/workspaces?page=${currentPage}&pageSize=1000`;
+        const response = await smartsheetFetch<PaginatedResponse<Workspace>>(url, apiKey);
+        
+        if (response && response.data) {
+            allWorkspaces = [...allWorkspaces, ...response.data];
+            totalPages = response.totalPages || 1;
+            console.log(`Retrieved page ${currentPage} of ${totalPages} workspaces...`);
+        } else {
+            break;
+        }
+        
+        currentPage++;
+    } while (currentPage <= totalPages);
+
+    return allWorkspaces;
 }
 
 /**
@@ -98,18 +115,28 @@ async function getWorkspaceShares(apiKey: string, workspaceId: number): Promise<
 }
 
 /**
- * Main entry point: Fetches all workspaces and their corresponding sharing details.
- * We process items sequentially to be respectful of Smartsheet API rate limits.
+ * Main logic to process all workspaces and their permissions.
  */
-export async function processAllWorkspaces(apiKey: string): Promise<WorkspaceDetails[]> {
-    console.debug('Starting workspace processing...');
-    const workspaces = await listWorkspaces(apiKey);
-    console.debug(`Found ${workspaces.length} workspaces.`);
+export async function processAllWorkspaces(
+    apiKey: string, 
+    onProgress?: (msg: string) => void
+): Promise<WorkspaceDetails[]> {
+    if (onProgress) onProgress('Connecting to Smartsheet API...');
     
+    const workspaces = await listAllWorkspaces(apiKey);
     const details: WorkspaceDetails[] = [];
+    const total = workspaces.length;
 
-    // Process sequentially to prevent overwhelming the proxy and Smartsheet's rate limits
-    for (const workspace of workspaces) {
+    if (total === 0) return [];
+    if (onProgress) onProgress(`Discovered ${total} workspaces. Auditing permissions...`);
+
+    // We use a small delay between items to stay safely under Smartsheet's 300 requests/minute limit
+    for (let i = 0; i < total; i++) {
+        const workspace = workspaces[i];
+        if (onProgress) {
+            onProgress(`Analyzing ${i + 1} of ${total}: ${workspace.name}`);
+        }
+
         try {
             const shares = await getWorkspaceShares(apiKey, workspace.id);
             
@@ -130,20 +157,19 @@ export async function processAllWorkspaces(apiKey: string): Promise<WorkspaceDet
             details.push({
                 workspaceName: workspace.name,
                 owner: owner,
-                members: members.length > 0 ? members.join('\n') : 'No members found',
+                members: members.length > 0 ? members.join('\n') : 'Private (No other users)',
                 permissions: permissions.length > 0 ? permissions.join('\n') : 'N/A'
             });
             
-            // Add a small delay between requests (100ms) to ensure we stay under the burst rate limit
-            await new Promise(resolve => setTimeout(resolve, 100));
+            // Wait 200ms between calls to avoid hitting rate limits for large lists
+            await new Promise(resolve => setTimeout(resolve, 200));
         } catch (err) {
-            console.warn(`Could not retrieve shares for workspace: ${workspace.name}`, err);
-            // Append the workspace with an error state instead of failing the entire process
+            console.warn(`Could not audit workspace "${workspace.name}":`, err);
             details.push({
                 workspaceName: workspace.name,
-                owner: 'Restricted access',
-                members: 'Could not fetch list',
-                permissions: 'Check your permissions'
+                owner: 'Restricted Access',
+                members: 'Check your API token permissions',
+                permissions: 'N/A'
             });
         }
     }
